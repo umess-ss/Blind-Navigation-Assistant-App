@@ -12,15 +12,16 @@ class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs
 
     private var results = listOf<BoundingBox>()
     private var boxPaint = Paint()
-    private var announcedBoxPaint = Paint() // Paint for announced objects
-    private var lockedBoxPaint = Paint() // Paint for locked objects
+    private var announcedBoxPaint = Paint() 
+    private var lockedBoxPaint = Paint() 
+    private var lostBoxPaint = Paint() // Red for lost
     private var textBackgroundPaint = Paint()
     private var textPaint = Paint()
 
     private var bounds = Rect()
     
-    // ID of the currently locked object (if any)
     private var lockedObject: String? = null
+    private var currentState: NavigationSystem.NavState = NavigationSystem.NavState.IDLE
 
     init {
         initPaints()
@@ -33,6 +34,7 @@ class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs
         boxPaint.reset()
         announcedBoxPaint.reset()
         lockedBoxPaint.reset()
+        lostBoxPaint.reset()
         invalidate()
         initPaints()
     }
@@ -46,20 +48,21 @@ class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs
         textPaint.style = Paint.Style.FILL
         textPaint.textSize = 50f
 
-        // Default Green for unannounced
-        boxPaint.color = Color.GREEN
+        boxPaint.color = Color.BLUE
         boxPaint.strokeWidth = 8F
         boxPaint.style = Paint.Style.STROKE
         
-        // Blue for announced
-        announcedBoxPaint.color = Color.BLUE
+        announcedBoxPaint.color = Color.CYAN
         announcedBoxPaint.strokeWidth = 8F
         announcedBoxPaint.style = Paint.Style.STROKE
         
-        // Red for locked/target objects
-        lockedBoxPaint.color = Color.RED
-        lockedBoxPaint.strokeWidth = 10F // Slightly thicker
+        lockedBoxPaint.color = Color.GREEN
+        lockedBoxPaint.strokeWidth = 10F 
         lockedBoxPaint.style = Paint.Style.STROKE
+
+        lostBoxPaint.color = Color.RED
+        lostBoxPaint.strokeWidth = 10F
+        lostBoxPaint.style = Paint.Style.STROKE
     }
 
     override fun draw(canvas: Canvas) {
@@ -71,21 +74,19 @@ class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs
             val right = it.x2 * width
             val bottom = it.y2 * height
 
-            // Choose paint based on status
+            val isLocked = lockedObject != null && it.clsName.equals(lockedObject, ignoreCase = true)
+            
+            // Choose paint based on status and state
             val currentPaint = when {
-                lockedObject != null && it.clsName.equals(lockedObject, ignoreCase = true) -> lockedBoxPaint
+                isLocked && (currentState == NavigationSystem.NavState.LOST || currentState == NavigationSystem.NavState.TARGET_REACHED) -> lostBoxPaint
+                isLocked -> lockedBoxPaint
                 it.isAnnounced -> announcedBoxPaint
                 else -> boxPaint
             }
             
             canvas.drawRect(left, top, right, bottom, currentPaint)
             
-            // Append distance to the label if available
-            val drawableText = if (it.distance.isNotEmpty()) {
-                "${it.clsName} ${it.distance}"
-            } else {
-                it.clsName
-            }
+            val drawableText = String.format(java.util.Locale.US, "%s [ID:%d] %.1fm", it.clsName, it.trackingId, it.distanceInMeters)
 
             textBackgroundPaint.getTextBounds(drawableText, 0, drawableText.length, bounds)
             val textWidth = bounds.width()
@@ -98,12 +99,12 @@ class OverlayView(context: Context?, attrs: AttributeSet?) : View(context, attrs
                 textBackgroundPaint
             )
             canvas.drawText(drawableText, left, top + bounds.height(), textPaint)
-
         }
     }
 
-    fun setResults(boundingBoxes: List<BoundingBox>) {
+    fun setResults(boundingBoxes: List<BoundingBox>, state: NavigationSystem.NavState) {
         results = boundingBoxes
+        currentState = state
         invalidate()
     }
     

@@ -12,6 +12,10 @@ data class BoundingBox(
     val cnf: Float,
     val cls: Int,
     val clsName: String,
-    var distance: String = "", // Added field to store distance
-    var isAnnounced: Boolean = false // Added field to track announcement status
+    var distance: String = "", 
+    var isAnnounced: Boolean = false, 
+    var trackingId: Int = -1, 
+    var depthCategory: String = "FAR",
+    var rawDepthScore: Float = 0f, // Normalized inverse depth (0..1, 1 is close)
+    var distanceInMeters: Float = 0f // Estimated metric distance
 )

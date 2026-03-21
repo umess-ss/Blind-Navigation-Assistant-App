@@ -1,11 +1,18 @@
 package com.app_for_blind.yolov8tflite
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -35,7 +42,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
 
-class MainActivity : AppCompatActivity(), Detector.DetectorListener, TextToSpeech.OnInitListener {
+class MainActivity : AppCompatActivity(), Detector.DetectorListener, TextToSpeech.OnInitListener, SensorEventListener {
     private lateinit var binding: ActivityMainBinding
     private val isFrontCamera = false
 
@@ -45,123 +52,130 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener, TextToSpeec
     private var cameraProvider: ProcessCameraProvider? = null
     private var detector: Detector? = null
     private var depthEstimator: DepthEstimator? = null
+    private var tracker = SimpleTracker()
+    private lateinit var navigationSystem: NavigationSystem
 
     private lateinit var cameraExecutor: ExecutorService
     private var tts: TextToSpeech? = null
-    private var isSpeaking = false
     
-    // Speech Recognition
+    @Volatile
+    private var isSpeaking = false
+    private var lastSpeakTime = 0L
+    
+    // Voice Selection & Recognition
     private lateinit var speechRecognizer: SpeechRecognizer
     private lateinit var recognitionIntent: Intent
+    private var canStartListening = true
+    private var framesSinceError = 0
+    private val REQUIRED_FRAMES_AFTER_ERROR = 30 
+
+    // Accelerometer Sensors
+    private lateinit var sensorManager: SensorManager
+    private var accelerometer: Sensor? = null
+    private var accelX: Float = 0f
+    private var accelY: Float = 0f
+    private var accelZ: Float = 0f
+
+    // Startup Logic
+    private var isStartupPhase = true
+    private val startupDetections = mutableSetOf<String>()
     
     // Gesture Detector
     private lateinit var gestureDetector: GestureDetector
     
     // Application States
     enum class AppState {
+        STARTUP,
         DETECTING,
-        PROMPTING,
         LISTENING,
         NAVIGATING,
         COMPLETED,
-        SCENE_DESCRIPTION // New state for Scene Description feature
+        SCENE_DESCRIPTION 
     }
     
-    private var currentState = AppState.DETECTING
+    private var currentState = AppState.STARTUP
     private var targetObjectName: String? = null
     
-    // To help with re-orientation if target is lost
-    private var lastKnownDirection: String = "center"
-
-    // Track last spoken time for each object class separately
-    private val lastSpokenTimes = ConcurrentHashMap<String, Long>()
-    private val SPEECH_COOLDOWN_MS = 10000L // 10 seconds cooldown per object
-    
-    // Memory of announced objects and when they were last seen
-    private val announcedObjects = ConcurrentHashMap<String, Long>()
-    private val objectLastSeenTime = ConcurrentHashMap<String, Long>()
-    private val OBJECT_PERSISTENCE_MS = 3000L // Keep objects in memory for 3 seconds after they leave frame
-    
-    // Navigation updates throttling
-    private var lastNavigationUpdate = 0L
-    private val NAVIGATION_UPDATE_INTERVAL = 3000L // Update every 3 seconds
-    private val NAVIGATION_REACHED_THRESHOLD = 0.2f // 0.2 meters (reduced from 0.5)
-
+    // Performance
+    private var frameCount = 0
+    private val MIDAS_SKIP_FRAMES = 5
     @Volatile
     private var currentDepthMap: FloatArray? = null
+    private var lastTrackedBoxes: List<BoundingBox> = emptyList()
+
+    // Announcements
+    private val lastSpokenTimes = ConcurrentHashMap<String, Long>()
+    private val SCAN_ANNOUNCEMENT_COOLDOWN = 20000L
+    private val announcedObjects = ConcurrentHashMap<String, Boolean>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // Initialize Text-To-Speech
         tts = TextToSpeech(this, this)
-        
-        // Initialize Speech Recognizer
-        initializeSpeechRecognizer()
+        navigationSystem = NavigationSystem { text, id -> speak(text, id) }
 
-        // Initialize Gesture Detector
+        initializeSpeechRecognizer()
         initializeGestureDetector()
+        initializeSensors()
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-
         cameraExecutor.execute {
-            detector = Detector(baseContext, MODEL_PATH, LABELS_PATH, this) {
-                toast(it)
-            }
+            detector = Detector(baseContext, MODEL_PATH, LABELS_PATH, this) { toast(it) }
             try {
                 depthEstimator = DepthEstimator(baseContext)
             } catch (e: Exception) {
-                Log.e(TAG, "Error initializing DepthEstimator: ${e.message}")
+                Log.e(TAG, "Error initializing DepthEstimator", e)
             }
         }
 
-        if (allPermissionsGranted()) {
-            startCamera()
-        } else {
-            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
-        }
+        if (allPermissionsGranted()) startCamera()
+        else ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
 
         bindListeners()
+        
+        navigationSystem.startScanning()
+        
+        // Handle Startup Object List
+        Handler(Looper.getMainLooper()).postDelayed({
+            finishStartupPhase()
+        }, 3000)
+    }
+
+    private fun finishStartupPhase() {
+        if (!isStartupPhase) return
+        isStartupPhase = false
+        
+        val objectsList = startupDetections.take(15).joinToString(", ")
+        val startupMsg = if (objectsList.isNotEmpty()) {
+            "I see: $objectsList. Double tap and say the object you want to find."
+        } else {
+            "I don't see anything yet. Double tap and say the object you want to find."
+        }
+        
+        speak(startupMsg, "STARTUP_DONE")
+        currentState = AppState.DETECTING
+        navigationSystem.setWaitingState()
+    }
+
+    private fun initializeSensors() {
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
     }
 
     private fun initializeGestureDetector() {
         gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDoubleTap(e: MotionEvent): Boolean {
-                // Handle double tap
-                runOnUiThread {
-                    handleDoubleTap()
-                }
+                handleDoubleTap()
                 return true
             }
-
-            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vX: Float, vY: Float): Boolean {
                 if (e1 == null) return false
-                val diffY = e2.y - e1.y
                 val diffX = e2.x - e1.x
-                
-                // Swipe Thresholds
-                val SWIPE_THRESHOLD = 100
-                val SWIPE_VELOCITY_THRESHOLD = 100
-                
-                if (abs(diffX) > abs(diffY)) {
-                    // Horizontal Swipe
-                    if (abs(diffX) > SWIPE_THRESHOLD && abs(velocityX) > SWIPE_VELOCITY_THRESHOLD) {
-                        if (diffX > 0) {
-                            // Swipe Right -> Reset
-                            runOnUiThread {
-                                handleSwipeRight()
-                            }
-                            return true
-                        } else {
-                            // Swipe Left -> Scene Description
-                            runOnUiThread {
-                                handleSwipeLeft()
-                            }
-                            return true
-                        }
-                    }
+                if (abs(diffX) > 100 && abs(vX) > 100) {
+                    if (diffX > 0) handleSwipeRight() else handleSwipeLeft()
+                    return true
                 }
                 return false
             }
@@ -169,93 +183,45 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener, TextToSpeec
     }
     
     private fun handleDoubleTap() {
-        // Stop current TTS
-        if (tts != null) {
-            tts!!.stop()
-        }
-        isSpeaking = false // Reset speaking flag since we forced stop
-        
-        // Change state to Listening immediately
+        if (!canStartListening) return
+        tts?.stop()
+        isSpeaking = false 
         currentState = AppState.LISTENING
-        
-        // Provide audio feedback and start listening
-        speak("Listening for target...", "MANUAL_LISTEN")
-        // "MANUAL_LISTEN" will trigger startListening in onDone callback
+        speak("What would you like to find?", "MANUAL_LISTEN")
     }
 
     private fun handleSwipeRight() {
-        // Reset to initial state
-        runOnUiThread {
-            if (tts != null) {
-                tts!!.stop()
-            }
-            isSpeaking = false
-            currentState = AppState.DETECTING
-            targetObjectName = null
-            binding.overlay.setLockedObject(null)
-            announcedObjects.clear()
-            lastSpokenTimes.clear()
-            objectLastSeenTime.clear()
-            
-            // Switch back to Camera tab if needed
-            binding.bottomNavigation.selectedItemId = R.id.navigation_camera
-            
-            speak("Resetting. I am looking for objects.", "RESET_SWIPE")
-        }
+        tts?.stop()
+        isSpeaking = false
+        currentState = AppState.DETECTING
+        targetObjectName = null
+        navigationSystem.reset()
+        binding.overlay.setLockedObject(null)
+        announcedObjects.clear()
+        lastSpokenTimes.clear()
+        binding.bottomNavigation.selectedItemId = R.id.navigation_camera
+        speak("System reset. Looking for objects.", "RESET_SWIPE")
     }
 
     private fun handleSwipeLeft() {
-        // Switch to Scene Description
-        runOnUiThread {
-            if (currentState != AppState.SCENE_DESCRIPTION) {
-                // Stop any ongoing speech
-                if (tts != null) {
-                    tts!!.stop()
-                }
-                isSpeaking = false
-                
-                // Set state to avoid interruptions
-                currentState = AppState.SCENE_DESCRIPTION
-                
-                // Update UI tab
-                binding.bottomNavigation.selectedItemId = R.id.navigation_scene
-                
-                // Trigger Scene Description Logic
-                triggerSceneDescription()
-            }
+        if (currentState != AppState.SCENE_DESCRIPTION) {
+            tts?.stop()
+            isSpeaking = false
+            currentState = AppState.SCENE_DESCRIPTION
+            binding.bottomNavigation.selectedItemId = R.id.navigation_scene
+            pendingSceneDescription = true
         }
-    }
-    
-    private fun triggerSceneDescription() {
-        // This function will be called once per activation
-        // We will use the latest detection results to formulate a description
-        // Since we are in the main thread here, we need to access the latest bounding boxes.
-        // However, bounding boxes are passed via onDetect callback.
-        // We can create a flag to request a scene snapshot on the next frame or use stored data if available.
-        // For simplicity, let's set a flag "pendingSceneDescription" and handle it in onDetect for the immediate next frame.
-        
-        // Actually, we can just look at announcedObjects or better, wait for the next detections.
-        // Let's set a flag.
-        pendingSceneDescription = true
     }
     
     private var pendingSceneDescription = false
 
-    // Pass touch events to gesture detector
-    override fun onTouchEvent(event: MotionEvent?): Boolean {
-        return if (event != null) {
-            gestureDetector.onTouchEvent(event) || super.onTouchEvent(event)
-        } else {
-            super.onTouchEvent(event)
-        }
-    }
+    override fun onTouchEvent(event: MotionEvent?): Boolean = event?.let { gestureDetector.onTouchEvent(it) || super.onTouchEvent(it) } ?: super.onTouchEvent(event)
 
     private fun initializeSpeechRecognizer() {
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
         recognitionIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
         }
         
         speechRecognizer.setRecognitionListener(object : RecognitionListener {
@@ -264,494 +230,290 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener, TextToSpeec
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
             override fun onEndOfSpeech() {}
-            
             override fun onError(error: Int) {
-                Log.e("SpeechRecognizer", "Error: $error")
                 if (currentState == AppState.LISTENING) {
-                     runOnUiThread {
-                         speak("I didn't catch that. Please try again.", "RETRY_PROMPT")
-                     }
+                     speak("I didn't catch that. Try again later.", "ERROR_SILENT")
+                     currentState = AppState.DETECTING
+                     framesSinceError = 0
+                     canStartListening = false
                 }
             }
-
             override fun onResults(results: Bundle?) {
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                if (!matches.isNullOrEmpty()) {
-                    val spokenText = matches[0]
-                    handleUserSpeech(spokenText)
-                } else {
-                    runOnUiThread {
-                        speak("I didn't catch that. Please try again.", "RETRY_PROMPT")
-                    }
+                if (!matches.isNullOrEmpty()) handleUserSpeech(matches[0])
+                else {
+                    speak("I didn't hear anything.", "ERROR_SILENT")
+                    currentState = AppState.DETECTING
                 }
             }
-
-            override fun onPartialResults(partialResults: Bundle?) {}
+            override fun onPartialResults(pResults: Bundle?) {}
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
     }
     
     private fun handleUserSpeech(text: String) {
-        val normalized = normalizeText(text)
-        Log.d("Speech", "Original: $text, Normalized: $normalized")
+        val raw = text.lowercase(Locale.ROOT).trim()
+        Log.d("Speech", "Input: $raw")
         
-        // Check if normalized text matches any previously announced object
-        val match = announcedObjects.keys.find { knownObject ->
-            normalized.contains(knownObject.lowercase(Locale.ROOT)) || 
-            knownObject.lowercase(Locale.ROOT).contains(normalized) 
+        if (raw.contains("reset") || raw.contains("stop")) {
+            handleSwipeRight()
+            return
         }
+
+        val target = extractObjectName(raw)
+        if (target.isEmpty()) {
+            speak("Object not recognized.", "ERROR_SILENT")
+            currentState = AppState.DETECTING
+            return
+        }
+
+        val normalizedTarget = normalizeClassName(target)
+        
+        val match = lastTrackedBoxes.filter { box ->
+            val normDetected = normalizeClassName(box.clsName.lowercase(Locale.ROOT))
+            normalizedTarget.contains(normDetected) || normDetected.contains(normalizedTarget)
+        }.minByOrNull { it.distanceInMeters }
         
         if (match != null) {
-            targetObjectName = match
+            targetObjectName = match.clsName
             currentState = AppState.NAVIGATING
-            // Update overlay with locked object
-            binding.overlay.setLockedObject(match)
-            speak("$match selected. Navigation will begin.", "NAV_START")
+            navigationSystem.setTarget(match.trackingId, match.clsName)
+            binding.overlay.setLockedObject(match.clsName)
+            speak("Target locked on ${match.clsName}.", "NAV_START")
         } else {
-            speak("I couldn't find $text. Please say the name of one of the detected objects.", "RETRY_PROMPT")
+            speak("I don't see a $target right now.", "DESCRIBE")
+            currentState = AppState.DETECTING
         }
     }
-    
-    private fun normalizeText(text: String): String {
-        var normalized = text.lowercase(Locale.ROOT)
-        val fillers = listOf("go to", "guide me to", "please", "navigate to", "find", "where is", "i want", "detect", "see")
-        fillers.forEach { normalized = normalized.replace(it, "") }
-        return normalized.trim()
+
+    private fun normalizeClassName(name: String): String = when {
+        name.contains("cup") || name.contains("mug") -> "cup"
+        name.contains("bowl") || name.contains("dish") -> "bowl"
+        name.contains("cell phone") || name.contains("phone") -> "cell phone"
+        name.contains("tv") || name.contains("monitor") -> "tv"
+        else -> name
+    }
+
+    private fun extractObjectName(text: String): String {
+        val prefixes = listOf("find ", "track ", "navigate to ", "go to ", "where is ", "looking for ")
+        var result = text
+        for (p in prefixes) if (result.startsWith(p)) { result = result.substring(p.length); break }
+        return result.trim()
     }
 
     private fun bindListeners() {
-        // Prevent manual tab switching to ensure gesture-only access logic works as intended,
-        // or allow it but sync state.
         binding.bottomNavigation.setOnItemSelectedListener { item ->
-            // If user clicks tabs manually, update state accordingly
             when (item.itemId) {
-                R.id.navigation_camera -> {
-                    if (currentState == AppState.SCENE_DESCRIPTION) {
-                        handleSwipeRight() // Reuse reset/camera logic
-                    }
-                    true
-                }
-                R.id.navigation_scene -> {
-                    if (currentState != AppState.SCENE_DESCRIPTION) {
-                        handleSwipeLeft() // Reuse scene logic
-                    }
-                    true
-                }
+                R.id.navigation_camera -> { if (currentState == AppState.SCENE_DESCRIPTION) handleSwipeRight(); true }
+                R.id.navigation_scene -> { if (currentState != AppState.SCENE_DESCRIPTION) handleSwipeLeft(); true }
                 else -> false
             }
         }
     }
 
     private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            cameraProvider  = cameraProviderFuture.get()
+        ProcessCameraProvider.getInstance(this).addListener({
+            cameraProvider = ProcessCameraProvider.getInstance(this).get()
             bindCameraUseCases()
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun bindCameraUseCases() {
-        val cameraProvider = cameraProvider ?: throw IllegalStateException("Camera initialization failed.")
-
+        val provider = cameraProvider ?: return
         val rotation = binding.viewFinder.display.rotation
-
-        val cameraSelector = CameraSelector
-            .Builder()
-            .requireLensFacing(CameraSelector.LENS_FACING_BACK)
-            .build()
-
-        preview =  Preview.Builder()
-            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
-            .setTargetRotation(rotation)
-            .build()
-
+        
+        preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_4_3).setTargetRotation(rotation).build()
         imageAnalyzer = ImageAnalysis.Builder()
             .setTargetAspectRatio(AspectRatio.RATIO_4_3)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setTargetRotation(binding.viewFinder.display.rotation)
+            .setTargetRotation(rotation)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .build()
 
         imageAnalyzer?.setAnalyzer(cameraExecutor) { imageProxy ->
-            val bitmapBuffer =
-                Bitmap.createBitmap(
-                    imageProxy.width,
-                    imageProxy.height,
-                    Bitmap.Config.ARGB_8888
-                )
-            imageProxy.use { bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
-            imageProxy.close()
+            val buffer = Bitmap.createBitmap(imageProxy.width, imageProxy.height, Bitmap.Config.ARGB_8888)
+            imageProxy.use { buffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
+            val rotated = Bitmap.createBitmap(buffer, 0, 0, buffer.width, buffer.height, Matrix().apply { postRotate(imageProxy.imageInfo.rotationDegrees.toFloat()) }, true)
 
-            val matrix = Matrix().apply {
-                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-
-                if (isFrontCamera) {
-                    postScale(
-                        -1f,
-                        1f,
-                        imageProxy.width.toFloat(),
-                        imageProxy.height.toFloat()
-                    )
-                }
-            }
-
-            val rotatedBitmap = Bitmap.createBitmap(
-                bitmapBuffer, 0, 0, bitmapBuffer.width, bitmapBuffer.height,
-                matrix, true
-            )
-
-            currentDepthMap = depthEstimator?.computeDepthMap(rotatedBitmap)
-            detector?.detect(rotatedBitmap)
+            if (frameCount % MIDAS_SKIP_FRAMES == 0) currentDepthMap = depthEstimator?.computeDepthMap(rotated)
+            frameCount++
+            detector?.detect(rotated)
         }
 
-        cameraProvider.unbindAll()
-
+        provider.unbindAll()
         try {
-            camera = cameraProvider.bindToLifecycle(
-                this,
-                cameraSelector,
-                preview,
-                imageAnalyzer
-            )
-
+            camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalyzer)
             preview?.surfaceProvider = binding.viewFinder.surfaceProvider
-        } catch(exc: Exception) {
-            Log.e(TAG, "Use case binding failed", exc)
-        }
-    }
-
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
-    }
-
-    private val requestPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()) {
-        if (it[Manifest.permission.CAMERA] == true && it[Manifest.permission.RECORD_AUDIO] == true) { 
-            startCamera() 
-        }
-    }
-
-    private fun toast(message: String) {
-        runOnUiThread {
-            Toast.makeText(baseContext, message, Toast.LENGTH_LONG).show()
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        detector?.close()
-        depthEstimator?.close()
-        cameraExecutor.shutdown()
-        try {
-            speechRecognizer.destroy()
-        } catch (e: Exception) {
-            Log.e("Speech", "Error destroying speech recognizer", e)
-        }
-        if (tts != null) {
-            tts?.stop()
-            tts?.shutdown()
-        }
-    }
-
-    override fun onResume() {
-        super.onResume()
-        if (allPermissionsGranted()){
-            startCamera()
-        } else {
-            requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
-        }
-    }
-
-    companion object {
-        private const val TAG = "Camera"
-        private const val REQUEST_CODE_PERMISSIONS = 10
-        private val REQUIRED_PERMISSIONS = mutableListOf (
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO
-        ).toTypedArray()
+        } catch(e: Exception) { Log.e(TAG, "Binding failed", e) }
     }
 
     override fun onEmptyDetect() {
-        runOnUiThread {
-            binding.overlay.clear()
-        }
+        runOnUiThread { binding.overlay.clear() }
     }
 
     override fun onDetect(boundingBoxes: List<BoundingBox>, inferenceTime: Long) {
-        val depthMap = currentDepthMap
-        val estimator = depthEstimator
-        val currentTime = System.currentTimeMillis()
+        val tracked = tracker.update(boundingBoxes)
+        currentDepthMap?.let { depthEstimator?.processDepthForBoxes(it, tracked) }
+        lastTrackedBoxes = tracked
 
-        // 1. Update last seen times for current objects
-        boundingBoxes.forEach { box ->
-            objectLastSeenTime[box.clsName] = currentTime
+        if (isStartupPhase) {
+            boundingBoxes.forEach { startupDetections.add(it.clsName) }
         }
 
-        // 2. Memory Cleanup
-        val toRemove = ArrayList<String>()
-        announcedObjects.keys.forEach { clsName ->
-            val lastSeen = objectLastSeenTime[clsName] ?: 0L
-            if (currentTime - lastSeen > OBJECT_PERSISTENCE_MS) {
-                toRemove.add(clsName)
-            }
-        }
-        toRemove.forEach { 
-            announcedObjects.remove(it) 
-            objectLastSeenTime.remove(it)
-        }
-
-        // 3. Process Depth & Status
-        if (depthMap != null && estimator != null) {
-            boundingBoxes.forEach { box ->
-                val distance = estimator.getDistance(depthMap, box)
-                box.distance = String.format("%.1f m", distance)
-                if (announcedObjects.containsKey(box.clsName)) {
-                    box.isAnnounced = true
-                }
-            }
+        if (!canStartListening) {
+            framesSinceError++
+            if (framesSinceError >= REQUIRED_FRAMES_AFTER_ERROR) canStartListening = true
         }
 
         runOnUiThread {
-            binding.overlay.apply {
-                setResults(boundingBoxes)
-                invalidate()
-            }
-            
-            // Check for Scene Description Request
-            if (pendingSceneDescription && currentState == AppState.SCENE_DESCRIPTION) {
+            binding.overlay.setResults(tracked, navigationSystem.getCurrentState())
+            binding.overlay.invalidate()
+            val now = System.currentTimeMillis()
+
+            if (currentState == AppState.SCENE_DESCRIPTION && pendingSceneDescription) {
                 pendingSceneDescription = false
-                generateSceneDescription(boundingBoxes)
+                generateSceneDescription(tracked)
             } else {
-                // Normal Logic if NOT in Scene Description mode
-                if (currentState != AppState.SCENE_DESCRIPTION) {
-                    when (currentState) {
-                        AppState.DETECTING -> handleDetectingState(boundingBoxes, currentTime)
-                        AppState.NAVIGATING -> handleNavigatingState(boundingBoxes, currentTime)
-                        else -> { 
-                            // In PROMPTING and LISTENING states, we pause visual descriptions
+                when (currentState) {
+                    AppState.DETECTING -> handleDetectingState(tracked, now)
+                    AppState.NAVIGATING -> {
+                        navigationSystem.update(tracked, accelX, accelY, accelZ)
+                        if (navigationSystem.getCurrentState() == NavigationSystem.NavState.TARGET_REACHED) {
+                            currentState = AppState.COMPLETED
+                            speak("Target reached. You have arrived at the ${targetObjectName ?: "object"}.", "REACHED_FINAL")
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                handleSwipeRight()
+                            }, 5000)
                         }
                     }
+                    AppState.COMPLETED -> {}
+                    else -> {}
                 }
             }
         }
     }
     
-    private fun generateSceneDescription(boundingBoxes: List<BoundingBox>) {
-        if (boundingBoxes.isEmpty()) {
-            speak("The scene appears to be empty. No objects detected.", "SCENE_DESC")
-            // Return to Camera mode after speech is done handled by onUtteranceDone or manual swipe
-            // Requirement says: "After completing the description: Stop speaking. Return control to the main camera view."
-            // We can schedule a return to DETECTING in onUtteranceDone
-            return
-        }
-
-        // Analyze objects
-        val objectCounts = boundingBoxes.groupingBy { it.clsName }.eachCount()
-        val objectsString = objectCounts.entries.joinToString(separator = ", ") { "${it.key}" }
-        
-        // Analyze Spatial Context
-        // Check if there are objects in the center (path blocked)
-        val centerObjects = boundingBoxes.filter { it.cx in 0.3..0.7 }
-        val pathStatus = if (centerObjects.isEmpty()) "The path ahead appears mostly clear." else "There are objects directly in front of you."
-        
-        // Environment Type Guess (Simple heuristic based on objects)
-        // E.g., Bed/Couch -> Room/Bedroom, Chair/Table -> Room/Office
-        val indoorObjects = setOf("bed", "couch", "chair", "dining table", "tv", "laptop", "microwave", "refrigerator")
-        val isIndoor = boundingBoxes.any { indoorObjects.contains(it.clsName.lowercase()) }
-        val envType = if (isIndoor) "You are in a room" else "You are in an environment"
-
-        val description = "$envType with $objectsString nearby. $pathStatus"
-        
-        speak(description, "SCENE_DESC")
-    }
-    
-    private fun handleDetectingState(boundingBoxes: List<BoundingBox>, currentTime: Long) {
+    private fun handleDetectingState(boxes: List<BoundingBox>, now: Long) {
         if (isSpeaking) return
-        
-        val unannouncedCandidates = boundingBoxes.filter { !it.isAnnounced }
-        
-        if (unannouncedCandidates.isNotEmpty()) {
-            val bestCandidate = unannouncedCandidates.maxByOrNull { it.cnf }
-            if (bestCandidate != null) {
-                val objectName = bestCandidate.clsName
-                val lastTime = lastSpokenTimes[objectName] ?: 0L
-                
-                if (currentTime - lastTime > SPEECH_COOLDOWN_MS) {
-                    val direction = getDirection(bestCandidate.cx)
-                    val speechText = if (bestCandidate.distance.isNotEmpty()) {
-                        "I see a $objectName at ${bestCandidate.distance.replace("m", "meters")} on your $direction"
-                    } else {
-                        "I see a $objectName on your $direction"
-                    }
-                    
-                    announcedObjects[objectName] = currentTime
-                    objectLastSeenTime[objectName] = currentTime // Ensure it's marked as seen
-                    lastSpokenTimes[objectName] = currentTime
-                    bestCandidate.isAnnounced = true
-                    speak(speechText, "DESCRIBE")
+        boxes.forEach { box ->
+            if (announcedObjects[box.clsName] != true) {
+                val last = lastSpokenTimes[box.clsName] ?: 0L
+                if (now - last > SCAN_ANNOUNCEMENT_COOLDOWN) {
+                    announcedObjects[box.clsName] = true
+                    lastSpokenTimes[box.clsName] = now
+                    val dist = String.format(java.util.Locale.US, "%.1f meters", box.distanceInMeters)
+                    speak("I see a ${box.clsName} ${getDirectionLabel(box.cx)}, $dist away.", "DESCRIBE")
                 }
             }
-        } else {
-            // Trigger PROMPT if we have announced objects and they are still somewhat recent
-            // Check if there are ANY known objects
-            if (announcedObjects.isNotEmpty()) {
-                 currentState = AppState.PROMPTING
-                 speak("Please say the name of the object you want to navigate to.", "PROMPT")
-            }
         }
     }
-    
-    private fun handleNavigatingState(boundingBoxes: List<BoundingBox>, currentTime: Long) {
-        if (currentTime - lastNavigationUpdate < NAVIGATION_UPDATE_INTERVAL) return
-        if (isSpeaking) return
-        
-        val target = targetObjectName ?: return
-        
-        val targetBox = boundingBoxes.find { it.clsName.equals(target, ignoreCase = true) }
-        
-        if (targetBox != null) {
-            // Update last known direction when target is visible
-            lastKnownDirection = getDirection(targetBox.cx)
-            
-            val rawDist = targetBox.distance.split(" ")[0].toFloatOrNull() ?: 100f
-            
-            // CHECK IF REACHED
-            if (rawDist < NAVIGATION_REACHED_THRESHOLD && rawDist > 0) {
-                 speak("Object found. You have reached the $target.", "NAV_COMPLETE")
-                 currentState = AppState.COMPLETED
-                 return
-            }
-            
-            // GENERATE GUIDANCE
-            val directionInstruction = getNavigationInstruction(targetBox.cx)
-            val distText = targetBox.distance.replace("m", "meters")
-            
-            // Check for closer obstacles
-            val obstacle = boundingBoxes.find { 
-                !it.clsName.equals(target, ignoreCase = true) && 
-                isCloser(it.distance, targetBox.distance) &&
-                isInFront(it.cx) 
-            }
-            
-            if (obstacle != null) {
-                 val obstacleDir = getDirection(obstacle.cx)
-                 val avoidInstruction = if (obstacleDir == "center") "Obstacle ahead. Move side." else "Obstacle on your $obstacleDir."
-                 speak("$avoidInstruction $target is $distText", "NAV_OBSTACLE")
-            } else {
-                 speak("$directionInstruction. $target is $distText ahead.", "NAV_UPDATE")
-            }
-            lastNavigationUpdate = currentTime
-        } else {
-            // TARGET LOST - Provide corrective guidance based on last known position
-            val correction = when (lastKnownDirection) {
-                "left" -> "Turn left"
-                "right" -> "Turn right"
-                else -> "Turn around slowly"
-            }
-            speak("Target not visible. $correction.", "NAV_LOST")
-            lastNavigationUpdate = currentTime
-        }
+
+    private fun generateSceneDescription(boxes: List<BoundingBox>) {
+        if (boxes.isEmpty()) speak("Nothing detected.", "SCENE_DESC")
+        else speak("I see ${boxes.groupBy { it.clsName }.map { "${it.value.size} ${it.key}" }.joinToString(", ")}.", "SCENE_DESC")
     }
     
-    private fun getNavigationInstruction(cx: Float): String {
-        return when {
-            cx < 0.4 -> "Turn slightly left"
-            cx > 0.6 -> "Turn right"
-            else -> "Move forward"
-        }
-    }
-    
-    private fun getDirection(cx: Float): String {
-        return when {
-            cx < 0.4 -> "left"
-            cx > 0.6 -> "right"
-            else -> "center"
-        }
-    }
-    
-    private fun isCloser(dist1: String, dist2: String): Boolean {
-        // Parse "1.2 m"
-        val d1 = dist1.split(" ")[0].toFloatOrNull() ?: 100f
-        val d2 = dist2.split(" ")[0].toFloatOrNull() ?: 100f
-        return d1 < d2
-    }
-    
-    private fun isInFront(cx: Float): Boolean {
-        return cx in 0.3..0.7
+    private fun getDirectionLabel(cx: Float): String = when {
+        cx < 0.38f -> "on your left"
+        cx > 0.62f -> "on your right"
+        else -> "ahead of you"
     }
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            val result = tts!!.setLanguage(Locale.US)
-            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                Log.e("TTS", "The Language not supported!")
-            } else {
-                tts!!.setSpeechRate(0.85f)
-                
-                tts!!.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) {
-                        isSpeaking = true
-                    }
-
-                    override fun onDone(utteranceId: String?) {
-                        isSpeaking = false
-                        handleUtteranceDone(utteranceId)
-                    }
-
-                    override fun onError(utteranceId: String?) {
-                        isSpeaking = false
-                    }
+            tts?.apply {
+                language = Locale.US
+                setSpeechRate(0.85f)
+                setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(id: String?) { this@MainActivity.isSpeaking = true }
+                    override fun onDone(id: String?) { this@MainActivity.isSpeaking = false; handleUtteranceDone(id) }
+                    override fun onError(id: String?) { this@MainActivity.isSpeaking = false }
                 })
-                
-                speak("Camera started. I am looking for objects.", "INIT")
             }
         }
     }
     
-    private fun handleUtteranceDone(utteranceId: String?) {
+    private fun handleUtteranceDone(id: String?) {
         runOnUiThread {
-            when (utteranceId) {
-                "PROMPT", "RETRY_PROMPT", "MANUAL_LISTEN" -> {
-                    currentState = AppState.LISTENING
-                    startListening()
-                }
-                "NAV_COMPLETE", "RESET_SWIPE" -> {
-                     // Reset to detecting state after completion
-                     currentState = AppState.DETECTING
-                     targetObjectName = null
-                     binding.overlay.setLockedObject(null)
-                     announcedObjects.clear()
-                     lastSpokenTimes.clear()
-                     objectLastSeenTime.clear()
-                     binding.bottomNavigation.selectedItemId = R.id.navigation_camera
-                }
-                "SCENE_DESC" -> {
-                    // After scene description finishes, return to Main Camera View (DETECTING state)
-                    // Reset UI tab to Camera
-                    binding.bottomNavigation.selectedItemId = R.id.navigation_camera
+            when (id) {
+                "MANUAL_LISTEN" -> { currentState = AppState.LISTENING; startListening() }
+                "REACHED_FINAL", "NAV_COMPLETE", "SCENE_DESC", "RESET_SWIPE", "COMPLETED", "ERROR_SILENT" -> {
                     currentState = AppState.DETECTING
+                    binding.bottomNavigation.selectedItemId = R.id.navigation_camera
                 }
             }
         }
     }
     
-    private fun startListening() {
-        try {
-            speechRecognizer.startListening(recognitionIntent)
-            Toast.makeText(this, "Listening...", Toast.LENGTH_SHORT).show()
-        } catch (e: Exception) {
-            Log.e("Speech", "Start listening failed", e)
+    private fun startListening() { try { speechRecognizer.startListening(recognitionIntent) } catch (e: Exception) {} }
+
+    private var lastLowPrioritySpeakTime = 0L
+    private val LOW_PRIORITY_COOLDOWN_MS = 2000L
+
+    private fun speak(text: String, id: String) {
+        val now = System.currentTimeMillis()
+
+        // HIGH priority — cancel everything, speak NOW
+        if (id == "HIGH_PRIORITY" || id == "REACHED_FINAL" || id == "OBSTACLE") {
+            tts?.stop()
+            isSpeaking = false
+            val params = Bundle().apply { putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, id) }
+            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, id)
+            lastSpeakTime = now
+            return
+        }
+
+        // MEDIUM priority — queue it (don't silently drop)
+        if (id == "NAV_GUIDANCE" || id == "NAV_CLOSE" || id == "NAV_LOST" || id == "NAV_FOUND") {
+            if (now - lastLowPrioritySpeakTime < LOW_PRIORITY_COOLDOWN_MS) return
+            val params = Bundle().apply { putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, id) }
+            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, id)
+            lastSpeakTime = now
+            lastLowPrioritySpeakTime = now
+            return
+        }
+
+        // LOW priority — drop if speaking or too soon
+        if (isSpeaking) return
+        if (now - lastLowPrioritySpeakTime < LOW_PRIORITY_COOLDOWN_MS) return
+
+        val params = Bundle().apply { putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, id) }
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, id)
+        lastSpeakTime = now
+        lastLowPrioritySpeakTime = now
+    }
+
+    private fun toast(message: String) { runOnUiThread { Toast.makeText(baseContext, message, Toast.LENGTH_LONG).show() } }
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
+    override fun onResume() { 
+        super.onResume() 
+        if (allPermissionsGranted()) startCamera() else requestPermissionLauncher.launch(REQUIRED_PERMISSIONS)
+        accelerometer?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
     }
 
-    private fun speak(text: String, utteranceId: String) {
-        val params = Bundle()
-        params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
-        
-        if (utteranceId == "PROMPT" || utteranceId == "RETRY_PROMPT" || utteranceId == "NAV_START" || utteranceId == "NAV_COMPLETE" || utteranceId == "MANUAL_LISTEN" || utteranceId == "RESET_SWIPE" || utteranceId == "SCENE_DESC") {
-             tts!!.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
-        } else {
-             tts!!.speak(text, TextToSpeech.QUEUE_ADD, params, utteranceId)
+    override fun onPause() {
+        super.onPause()
+        sensorManager.unregisterListener(this)
+    }
+
+    private val requestPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { if (it[Manifest.permission.CAMERA] == true && it[Manifest.permission.RECORD_AUDIO] == true) startCamera() }
+    override fun onDestroy() { super.onDestroy() ; detector?.close() ; depthEstimator?.close() ; cameraExecutor.shutdown() ; try { speechRecognizer.destroy() } catch (e: Exception) {} ; tts?.stop() ; tts?.shutdown() }
+
+    override fun onSensorChanged(event: SensorEvent?) {
+        if (event != null && event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+            accelX = event.values[0]
+            accelY = event.values[1]
+            accelZ = event.values[2]
         }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    companion object {
+        private const val TAG = "Camera"
+        private const val REQUEST_CODE_PERMISSIONS = 10
+        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
     }
 }
