@@ -14,6 +14,7 @@ class NavigationSystem(private val tts: (String, String) -> Unit) {
         WAITING_FOR_COMMAND,
         OBJECT_SELECTED,
         TRACKING,
+        APPROACHING,
         VERY_CLOSE,
         TARGET_REACHED,
         LOST,
@@ -35,7 +36,13 @@ class NavigationSystem(private val tts: (String, String) -> Unit) {
     private var lastObstacleTime = 0L
     private val OBSTACLE_COOLDOWN_MS = 2500L 
 
+    // Lost-state navigation memory
     private var lastKnownCx: Float = 0.5f
+    private var lastKnownCy: Float = 0.5f
+    private var lastKnownDist: Float = 5.0f
+    private var lostStartTime: Long = 0L
+    private var lastLostGuidanceTime: Long = 0L
+    private val LOST_GUIDANCE_INTERVAL_MS = 3000L
     
     // Depth Baseline Lock variables
     private var selectionDepth: Float = -1f
@@ -65,6 +72,10 @@ class NavigationSystem(private val tts: (String, String) -> Unit) {
         lastAccelTime = 0
         lastObstacleTime = 0
         lastKnownCx = 0.5f
+        lastKnownCy = 0.5f
+        lastKnownDist = 5.0f
+        lostStartTime = 0L
+        lastLostGuidanceTime = 0L
         selectionDepth = -1f
         selectionBBoxArea = -1f
         smoothedDist = -1f
@@ -139,6 +150,11 @@ class NavigationSystem(private val tts: (String, String) -> Unit) {
 
         if (objectDetected) {
             val wasLost = currentState == NavState.LOST
+            if (lostFrames == 0 && objectDetected && target != null) {
+                lastKnownCx = target.cx
+                lastKnownCy = target.cy
+                lastKnownDist = target.distanceInMeters
+            }
             lostFrames = 0
             lastObjectDetectedTime = currentTime
             lostVoiceFired = false
@@ -162,11 +178,22 @@ class NavigationSystem(private val tts: (String, String) -> Unit) {
                 currentState = NavState.LOST
                 if (!lostVoiceFired) {
                     lostVoiceFired = true
-                    val side = if (lastKnownCx < 0.5f) "left" else "right"
-                    tts("Target lost. It was on your $side. Searching for $targetName.", "HIGH_PRIORITY")
+                    lostStartTime = currentTime
+                    lastLostGuidanceTime = currentTime
+                    val dir = getDirectionText(lastKnownCx)
+                    val dist = String.format(Locale.US, "%.1f", lastKnownDist)
+                    tts("Target lost. The ${targetName ?: "object"} was last seen $dir, $dist meters away.", "HIGH_PRIORITY")
                 }
             }
             
+            // Periodic lost guidance while still searching
+            if (currentTime - lastLostGuidanceTime > LOST_GUIDANCE_INTERVAL_MS) {
+                lastLostGuidanceTime = currentTime
+                val lostDuration = currentTime - lostStartTime
+                val searchInstruction = buildLostSearchInstruction(lostDuration)
+                tts(searchInstruction, "HIGH_PRIORITY")
+            }
+
             // Accelerometer assistance ONLY in LOST state
             if (currentTime - lastAccelTime > ACCEL_COOLDOWN_MS) {
                 if (accelX > 3.0f) {
@@ -295,6 +322,35 @@ class NavigationSystem(private val tts: (String, String) -> Unit) {
             val voiceId = if (finalDist <= 2.0f) "NAV_CLOSE" else "NAV_GUIDANCE"
             tts(voiceOutput, voiceId)
             lastGuidanceTime = currentTime
+        }
+    }
+
+    private fun buildLostSearchInstruction(lostDurationMs: Long): String {
+        val name = targetName ?: "object"
+        val dir = getDirectionText(lastKnownCx)
+        val dist = String.format(Locale.US, "%.1f", lastKnownDist)
+
+        return when {
+            lostDurationMs < 2000L -> {
+                // Phase 1: Object just slipped — small scan
+                "Slow down. Scan $dir to find the $name."
+            }
+            lostDurationMs < 5000L -> {
+                // Phase 2: May have moved past it
+                when {
+                    lastKnownCx < 0.38f -> "Turn left and scan slowly. The $name was on your left."
+                    lastKnownCx > 0.62f -> "Turn right and scan slowly. The $name was on your right."
+                    else -> "Stop and scan ahead. The $name was $dist meters in front of you."
+                }
+            }
+            else -> {
+                // Phase 3: Strong recovery — turn around if needed
+                when {
+                    lastKnownCx < 0.38f -> "Turn left. The $name was last seen $dir, $dist meters away."
+                    lastKnownCx > 0.62f -> "Turn right. The $name was last seen $dir, $dist meters away."
+                    else -> "Turn around slowly. The $name was last seen straight ahead, $dist meters away."
+                }
+            }
         }
     }
 
