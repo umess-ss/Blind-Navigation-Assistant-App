@@ -180,9 +180,10 @@ class NavigationSystem(private val tts: (String, String) -> Unit) {
                     lostVoiceFired = true
                     lostStartTime = currentTime
                     lastLostGuidanceTime = currentTime
-                    val dir = getDirectionText(lastKnownCx)
+                    val whereItWas = getDirectionText(lastKnownCx)
+                    val turnDir = getSearchTurnDirection(lastKnownCx)
                     val dist = String.format(Locale.US, "%.1f", lastKnownDist)
-                    tts("Target lost. The ${targetName ?: "object"} was last seen $dir, $dist meters away.", "HIGH_PRIORITY")
+                    tts("Target lost. The ${targetName ?: "object"} was $whereItWas. Turn $turnDir to find it.", "HIGH_PRIORITY")
                 }
             }
             
@@ -327,29 +328,23 @@ class NavigationSystem(private val tts: (String, String) -> Unit) {
 
     private fun buildLostSearchInstruction(lostDurationMs: Long): String {
         val name = targetName ?: "object"
-        val dir = getDirectionText(lastKnownCx)
+        val whereItWas = getDirectionText(lastKnownCx)
+        val turnDir = getSearchTurnDirection(lastKnownCx)
         val dist = String.format(Locale.US, "%.1f", lastKnownDist)
 
         return when {
             lostDurationMs < 2000L -> {
-                // Phase 1: Object just slipped — small scan
-                "Slow down. Scan $dir to find the $name."
+                // Phase 1: just slipped — small scan, same direction
+                "Slow down. The $name was $whereItWas. Scan $turnDir slowly."
             }
             lostDurationMs < 5000L -> {
-                // Phase 2: May have moved past it
-                when {
-                    lastKnownCx < 0.38f -> "Turn left and scan slowly. The $name was on your left."
-                    lastKnownCx > 0.62f -> "Turn right and scan slowly. The $name was on your right."
-                    else -> "Stop and scan ahead. The $name was $dist meters in front of you."
-                }
+                // Phase 2: may have moved — turn toward where it was
+                "Turn $turnDir. The $name was $whereItWas."
             }
             else -> {
-                // Phase 3: Strong recovery — turn around if needed
-                when {
-                    lastKnownCx < 0.38f -> "Turn left. The $name was last seen $dir, $dist meters away."
-                    lastKnownCx > 0.62f -> "Turn right. The $name was last seen $dir, $dist meters away."
-                    else -> "Turn around slowly. The $name was last seen straight ahead, $dist meters away."
-                }
+                // Phase 3: strong recovery with distance
+                "Turn $turnDir and search. The $name was last seen " +
+                "$whereItWas, $dist meters away."
             }
         }
     }
@@ -358,6 +353,12 @@ class NavigationSystem(private val tts: (String, String) -> Unit) {
         cx < 0.38f -> "to your left"
         cx > 0.62f -> "to your right"
         else -> "straight ahead"
+    }
+
+    private fun getSearchTurnDirection(cx: Float): String = when {
+        cx < 0.38f -> "left"   // object was left → turn left to find it
+        cx > 0.62f -> "right"  // object was right → turn right to find it
+        else -> "around"       // object was center → turn around slowly
     }
 
     fun getCurrentState(): NavState = currentState
